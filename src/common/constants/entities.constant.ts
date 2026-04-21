@@ -1,0 +1,55 @@
+export const RESOURCE_ENTITIES = [
+  'Claim',
+  'ClaimStatus',
+  'ClaimChangeHistory',
+  'Patient',
+  'Provider',
+  'Upload',
+  'EOBBatch',
+  'EOBLine',
+  'EOBPostingSession',
+  'InsuranceGroup',
+  'TrackedCPT',
+  'CAPPCheck',
+  'CAPPAlert',
+  'Invoice',
+] as const;
+
+export type ResourceEntityName = (typeof RESOURCE_ENTITIES)[number];
+
+export const ENTITY_COLLECTIONS: Record<ResourceEntityName, string> = {
+  Claim: 'claims',
+  ClaimStatus: 'claim_statuses',
+  ClaimChangeHistory: 'claim_change_history',
+  Patient: 'patients',
+  Provider: 'providers',
+  Upload: 'uploads',
+  EOBBatch: 'eob_batches',
+  EOBLine: 'eob_lines',
+  EOBPostingSession: 'eob_posting_sessions',
+  InsuranceGroup: 'insurance_groups',
+  TrackedCPT: 'tracked_cpts',
+  CAPPCheck: 'capp_checks',
+  CAPPAlert: 'capp_alerts',
+  Invoice: 'invoices',
+};
+
+export const DEFAULT_CLAIM_STATUSES = [
+  { id: 'status-to-be-billed', name: 'TO BE BILLED', color: 'indigo', is_active: true, sort_order: 1 },
+  { id: 'status-billed', name: 'BILLED', color: 'purple', is_active: true, sort_order: 2 },
+  { id: 'status-paid', name: 'PAID', color: 'green', is_active: true, sort_order: 3 },
+  { id: 'status-partially-paid', name: 'PARTIALLY PAID', color: 'teal', is_active: true, sort_order: 4 },
+  { id: 'status-pending', name: 'PENDING', color: 'yellow', is_active: true, sort_order: 5 },
+  { id: 'status-follow-up', name: 'FOLLOW UP', color: 'orange', is_active: true, sort_order: 6 },
+  { id: 'status-denied', name: 'DENIED', color: 'red', is_active: true, sort_order: 7 },
+  { id: 'status-charge-back', name: 'CHARGE BACK', color: 'orange', is_active: true, sort_order: 8 },
+  { id: 'status-not-seen', name: 'NOT SEEN', color: 'gray', is_active: true, sort_order: 9 },
+  { id: 'status-capped-medical', name: 'CAPPED/MEDICAL', color: 'blue', is_active: true, sort_order: 10 },
+  { id: 'status-capped-optum', name: 'CAPPED/OPTUM', color: 'purple', is_active: true, sort_order: 11 },
+  { id: 'status-capped-cmrcl', name: 'CAPPED/CMRCL', color: 'yellow', is_active: true, sort_order: 12 },
+  { id: 'status-secondary-denial', name: 'SECONDARY DENIAL', color: 'pink', is_active: true, sort_order: 13 },
+  { id: 'status-hold', name: 'HOLD', color: 'gray', is_active: true, sort_order: 14 },
+  { id: 'status-rto', name: 'RTO', color: 'pink', is_active: true, sort_order: 15 },
+  { id: 'status-pi-cases', name: 'PI CASES', color: 'pink', is_active: true, sort_order: 16 },
+  { id: 'status-resent', name: 'RESENT', color: 'blue', is_active: true, sort_order: 17 },
+];

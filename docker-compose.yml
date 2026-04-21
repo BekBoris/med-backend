@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: med-billing-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: med_billing_pro
+    volumes:
+      - mongodb_data:/data/db
+
+volumes:
+  mongodb_data:
