@@ -42,7 +42,9 @@ const normalizeFilterValue = (value: unknown): unknown => {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, innerValue]) => [
         key,
-        normalizeFilterValue(innerValue),
+        key.startsWith('$') && Array.isArray(innerValue)
+          ? innerValue
+          : normalizeFilterValue(innerValue),
       ]),
     );
   }
