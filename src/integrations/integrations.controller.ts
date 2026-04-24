@@ -3,17 +3,13 @@ import {
   Controller,
   Post,
   UploadedFile,
-  UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { IntegrationsService } from './integrations.service';
 
 @ApiTags('integrations')
-@ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
 @Controller('integrations/core')
 export class IntegrationsController {
   constructor(private readonly integrationsService: IntegrationsService) {}

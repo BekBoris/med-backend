@@ -29,7 +29,6 @@ async function bootstrap() {
     .setTitle('Med Billing API')
     .setDescription('NestJS + MongoDB replacement for the previous Base44 backend.')
     .setVersion('1.0.0')
-    .addBearerAuth()
     .build();
   const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('docs', app, swaggerDocument);

@@ -1,13 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
-import { AuthModule } from './auth/auth.module';
 import { FilesModule } from './files/files.module';
 import { HealthModule } from './health/health.module';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { ResourcesModule } from './resources/resources.module';
 import { SeedService } from './seed/seed.service';
-import { UsersModule } from './users/users.module';
 
 @Module({
   imports: [
@@ -21,8 +19,6 @@ import { UsersModule } from './users/users.module';
         uri: configService.get<string>('MONGODB_URI', 'mongodb://localhost:27017/med_billing_pro'),
       }),
     }),
-    UsersModule,
-    AuthModule,
     ResourcesModule,
     FilesModule,
     IntegrationsModule,

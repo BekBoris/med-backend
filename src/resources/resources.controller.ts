@@ -7,17 +7,13 @@ import {
   Patch,
   Post,
   Query,
-  UseGuards,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiTags } from '@nestjs/swagger';
 import { ResourceQueryDto } from '../common/dto/resource-query.dto';
 import { ensureResourceEntityName } from '../common/utils/entity.utils';
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ResourcesService } from './resources.service';
 
 @ApiTags('entities')
-@ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
 @Controller('entities')
 export class ResourcesController {
   constructor(private readonly resourcesService: ResourcesService) {}

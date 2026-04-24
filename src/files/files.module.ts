@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
-import { AuthModule } from '../auth/auth.module';
+import { JwtModule } from '@nestjs/jwt';
 import { FilesController } from './files.controller';
 import { FilesService } from './files.service';
 
 @Module({
-  imports: [AuthModule],
+  imports: [JwtModule.register({})],
   controllers: [FilesController],
   providers: [FilesService],
   exports: [FilesService],
