@@ -317,26 +317,42 @@ export class IntegrationsService {
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new BadGatewayException(
-          `MinerU extraction failed: ${errorText || response.statusText}`,
-        );
+        throw new Error(`MinerU extraction failed: ${errorText || response.statusText}`);
       }
 
       const result = (await response.json()) as { text?: string };
       if (!result.text?.trim()) {
-        throw new BadGatewayException('MinerU returned no extracted text.');
+        throw new Error('MinerU returned no extracted text.');
       }
 
       return result.text;
     } catch (error) {
-      if (error instanceof BadGatewayException) {
-        throw error;
-      }
-
-      throw new ServiceUnavailableException(
-        `MinerU service is unavailable at ${endpoint}. Start med-services/services.py or set MINERU_SERVICE_URL.`,
+      const unavailableMessage =
+        `MinerU service is unavailable at ${endpoint}. Start med-services/services.py or set MINERU_SERVICE_URL.`;
+      return this.extractPdfTextWithLocalFallback(
+        fileReference,
+        error instanceof Error ? error.message : unavailableMessage,
       );
     }
+  }
+
+  private async extractPdfTextWithLocalFallback(fileReference: string, mineruError: string) {
+    try {
+      const fallbackText = await this.filesService.readTextFromReference(fileReference);
+      if (fallbackText.trim()) {
+        return fallbackText;
+      }
+    } catch (error) {
+      throw new ServiceUnavailableException(
+        `${mineruError} Local PDF text extraction also failed: ${
+          error instanceof Error ? error.message : 'unknown error'
+        }. Install mineru[all] for OCR/image-based PDFs or upload a text-based PDF.`,
+      );
+    }
+
+    throw new ServiceUnavailableException(
+      `${mineruError} Local PDF text extraction also returned no text. Install mineru[all] for OCR/image-based PDFs or upload a text-based PDF.`,
+    );
   }
 
   private buildPrompt({
