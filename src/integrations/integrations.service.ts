@@ -6,9 +6,50 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { basename } from 'path';
+import { randomUUID } from 'crypto';
 import { FilesService } from '../files/files.service';
+import {
+  Block,
+  GetDocumentAnalysisCommand,
+  StartDocumentAnalysisCommand,
+  TextractClient,
+} from '@aws-sdk/client-textract';
+import { ResourcesService } from '../resources/resources.service';
 
 type JsonSchema = Record<string, unknown>;
+
+const defaultEobJsonSchema: JsonSchema = {
+  type: 'object',
+  properties: {
+    payer_name: { type: 'string' },
+    check_number: { type: 'string' },
+    check_date: { type: 'string' },
+    total_amount: { type: 'number' },
+    eob_lines: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          patient_name: { type: 'string' },
+          member_id: { type: 'string' },
+          dob: { type: 'string' },
+          icn: { type: 'string' },
+          dos_from: { type: 'string' },
+          dos_to: { type: 'string' },
+          cpt: { type: 'string' },
+          rendering_npi: { type: 'string' },
+          billed_amt: { type: 'number' },
+          allowed_amt: { type: 'number' },
+          provider_paid: { type: 'number' },
+          patient_resp: { type: 'number' },
+          carc_code: { type: 'string' },
+          remark_code: { type: 'string' },
+        },
+      },
+    },
+  },
+  required: ['payer_name', 'check_number', 'check_date', 'eob_lines'],
+};
 
 const extractJsonObject = (value: string) => {
   const trimmed = value.trim();
@@ -89,6 +130,18 @@ const toNumber = (value: string | undefined) => {
     .trim();
   const parsed = Number(cleaned);
   return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const toAmountNumber = (value: unknown) => {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  if (typeof value === 'string') {
+    return toNumber(value);
+  }
+
+  return 0;
 };
 
 const normalizeDate = (value: string | undefined) => {
@@ -213,12 +266,114 @@ const getSchemaKind = (schema: JsonSchema) => {
   return 'generic';
 };
 
+const splitTextTables = (text: string) =>
+  text
+    .split(/\n{2,}/)
+    .map((section) => section.trim())
+    .filter((section) => section.includes('\t') || section.includes(',') || section.includes('|'));
+
+const normalizeHeaderCell = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const getHeaderIndex = (headers: string[], patterns: string[]) =>
+  headers.findIndex((header) => patterns.some((pattern) => header.includes(pattern)));
+
+const getHeaderScore = (headers: string[]) => {
+  const hasDate = getHeaderIndex(headers, ['dos', 'service date', 'from date', 'date of service']) >= 0;
+  const hasProcedure = getHeaderIndex(headers, ['cpt', 'procedure', 'proc', 'service code']) >= 0;
+  const hasPayment = getHeaderIndex(headers, ['paid', 'payment', 'net paid', 'amount paid']) >= 0;
+  const hasCharge = getHeaderIndex(headers, ['billed', 'charge', 'submitted']) >= 0;
+  const hasAllowed = getHeaderIndex(headers, ['allowed', 'eligible', 'contracted']) >= 0;
+  const hasClaim = getHeaderIndex(headers, ['claim', 'icn', 'account', 'control']) >= 0;
+
+  return [hasDate, hasProcedure, hasPayment, hasCharge, hasAllowed, hasClaim].filter(Boolean).length;
+};
+
+const firstDateFromText = (value: string) =>
+  value.match(/\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/)?.[0] ||
+  value.match(/\b\d{6}\b/)?.[0] ||
+  '';
+
+const firstProcedureCodeFromText = (value: string) =>
+  value.match(/\b(?:[A-Z]?\d{4,5}[A-Z]?|\d{5}[A-Z]{0,2})\b/)?.[0] || '';
+
+const rowLooksLikeSummary = (rowText: string) =>
+  /^(total|subtotal|page|claim total|provider total|payment summary)\b/i.test(rowText.trim());
+
+const extractCheckTotalAmount = (text: string) => {
+  const labels = [
+    'check amount',
+    'check total',
+    'check/eft amount',
+    'eft amount',
+    'eft total',
+    'payment amount',
+    'payment total',
+    'total payment',
+    'remittance amount',
+    'remittance total',
+    'amount paid',
+    'net payment',
+    'net paid',
+  ];
+  const excludedContext = /\b(patient|member|subscriber|responsibility|deductible|coinsurance|copay|billed|charged|submitted|allowed|eligible|adjustment)\b/i;
+
+  for (const line of text.split('\n')) {
+    const normalized = line.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!normalized || excludedContext.test(normalized)) {
+      continue;
+    }
+
+    if (!labels.some((label) => normalized.includes(label))) {
+      continue;
+    }
+
+    const amounts = numbersFromText(line).filter((amount) => amount > 0);
+    if (amounts.length > 0) {
+      return amounts.at(-1) || 0;
+    }
+  }
+
+  const compactText = text.replace(/\s+/g, ' ');
+  for (const label of labels) {
+    const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\ /g, '\\s+');
+    const match = compactText.match(
+      new RegExp(`${escapedLabel}[^$\\d]{0,40}(\\(?\\$?\\d[\\d,]*(?:\\.\\d{2})?\\)?)`, 'i'),
+    );
+    if (match?.[1]) {
+      const amount = toNumber(match[1]);
+      if (amount > 0) {
+        return amount;
+      }
+    }
+  }
+
+  return 0;
+};
+
 @Injectable()
 export class IntegrationsService {
+  private textractClient?: TextractClient;
+
   constructor(
     private readonly filesService: FilesService,
     private readonly configService: ConfigService,
+    private readonly resourcesService: ResourcesService,
   ) {}
+
+  private getTextractClient() {
+    if (!this.textractClient) {
+      this.textractClient = new TextractClient({
+        region: this.configService.get<string>('AWS_REGION', 'us-west-1'),
+      });
+    }
+
+    return this.textractClient;
+  }
 
   async uploadFile(file: Express.Multer.File) {
     return this.filesService.storeFile(file, 'public');
@@ -236,16 +391,84 @@ export class IntegrationsService {
     return this.filesService.createSignedUrl(payload.file_uri, payload.expires_in ?? 3600);
   }
 
-  async extractDataFromUploadedFile(payload: {
-    file_url?: string;
+  createS3UploadUrl(payload: {
+    file_name?: string;
+    mime_type?: string;
+    folder?: string;
+    expires_in?: number;
+  }) {
+    return this.filesService.createS3PresignedUpload({
+      ...payload,
+      folder: payload.folder || 'eob',
+    });
+  }
+
+  async createEobBatchFromUpload(payload: {
+    upload_ref?: string;
+    batch?: Record<string, unknown>;
+  }) {
+    const upload = this.filesService.verifyUploadReference(payload.upload_ref || '');
+    const {
+      pdf_file_uri: _pdfFileUri,
+      source_file_uri: _sourceFileUri,
+      ...safeBatch
+    } = payload.batch || {};
+
+    return this.resourcesService.create('EOBBatch', {
+      ...safeBatch,
+      file_name:
+        typeof safeBatch.file_name === 'string'
+          ? safeBatch.file_name
+          : upload.fileName || 'uploaded-eob',
+      source_file_uri: upload.fileUri,
+      pdf_file_uri: upload.fileUri,
+    });
+  }
+
+  async extractDataFromEobBatch(payload: {
+    batch_id?: string;
     json_schema?: JsonSchema;
   }) {
-    if (!payload.file_url || !payload.json_schema) {
-      throw new BadRequestException('file_url and json_schema are required.');
+    if (!payload.batch_id || !payload.json_schema) {
+      throw new BadRequestException('batch_id and json_schema are required.');
+    }
+
+    const batch = await this.resourcesService.get('EOBBatch', payload.batch_id);
+    if (!batch) {
+      throw new BadRequestException('EOB batch was not found.');
+    }
+
+    const fileReference =
+      typeof batch.pdf_file_uri === 'string'
+        ? batch.pdf_file_uri
+        : typeof batch.source_file_uri === 'string'
+          ? batch.source_file_uri
+          : '';
+
+    if (!fileReference.startsWith('s3://')) {
+      throw new BadRequestException(
+        'This EOB batch is not backed by secure S3/KMS storage. Re-upload the original EOB before analysis.',
+      );
+    }
+
+    return this.extractDataFromUploadedFile({
+      file_url: fileReference,
+      json_schema: payload.json_schema,
+    });
+  }
+
+  async extractDataFromUploadedFile(payload: {
+    file_url?: string;
+    upload_ref?: string;
+    json_schema?: JsonSchema;
+  }) {
+    const fileReference = this.resolveFileReferenceFromPayload(payload);
+    if (!payload.json_schema) {
+      throw new BadRequestException('json_schema is required.');
     }
 
     try {
-      const extractedText = await this.extractTextFromFileReference(payload.file_url);
+      const extractedText = await this.extractTextFromFileReference(fileReference);
       const output = await this.generateStructuredResponse({
         prompt: this.buildExtractionPrompt(payload.json_schema),
         responseJsonSchema: payload.json_schema,
@@ -262,6 +485,124 @@ export class IntegrationsService {
         details: error instanceof Error ? error.message : 'Failed to extract data.',
       };
     }
+  }
+
+  private resolveFileReferenceFromPayload(payload: {
+    file_url?: string;
+    file_uri?: string;
+    upload_ref?: string;
+  }) {
+    if (payload.upload_ref) {
+      return this.filesService.verifyUploadReference(payload.upload_ref).fileUri;
+    }
+
+    const directReference = payload.file_uri || payload.file_url;
+    if (!directReference) {
+      throw new BadRequestException('A backend file reference is required.');
+    }
+
+    return directReference;
+  }
+
+  async extractAndStoreEobFromUploadedFile(payload: {
+    file_uri?: string;
+    upload_ref?: string;
+    file_name?: string;
+    json_schema?: JsonSchema;
+  }) {
+    const fileReference = this.resolveFileReferenceFromPayload(payload);
+    const responseJsonSchema = payload.json_schema || defaultEobJsonSchema;
+    const extractedText = await this.extractTextFromFileReference(fileReference);
+    const output = await this.generateStructuredResponse({
+      prompt: this.buildExtractionPrompt(responseJsonSchema),
+      responseJsonSchema,
+      attachedFileTexts: [extractedText],
+    });
+	    const eobOutput = output as {
+	      payer_name?: string;
+	      check_number?: string;
+	      check_date?: string;
+	      total_amount?: number | string;
+	      eob_lines?: Array<Record<string, unknown>>;
+	    };
+    const eobLines = Array.isArray(eobOutput.eob_lines) ? eobOutput.eob_lines : [];
+    const totals = eobLines.reduce<{
+      billed_amt: number;
+      allowed_amt: number;
+      provider_paid: number;
+      patient_resp: number;
+    }>(
+      (sum, line) => ({
+        billed_amt: sum.billed_amt + Number(line.billed_amt || 0),
+        allowed_amt: sum.allowed_amt + Number(line.allowed_amt || 0),
+        provider_paid: sum.provider_paid + Number(line.provider_paid || 0),
+        patient_resp: sum.patient_resp + Number(line.patient_resp || 0),
+      }),
+      {
+        billed_amt: 0,
+        allowed_amt: 0,
+        provider_paid: 0,
+        patient_resp: 0,
+      },
+	    );
+	    const eobId = `EOB-${Date.now()}-${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+    const extractedCheckTotal =
+      toAmountNumber(eobOutput.total_amount) || extractCheckTotalAmount(extractedText);
+    const batchTotalAmount = extractedCheckTotal || totals.provider_paid;
+	    const fileMeta = await this.filesService.getFileMetaFromReference(fileReference);
+
+    const eobBatch = await this.resourcesService.create('EOBBatch', {
+      eob_id: eobId,
+      file_name: payload.file_name || fileMeta.fileName,
+      payer_name: eobOutput.payer_name || '',
+      check_number: eobOutput.check_number || '',
+      check_date: eobOutput.check_date || '',
+      source_file_uri: fileReference,
+      pdf_file_uri: fileReference,
+      line_count: eobLines.length,
+      total_lines: eobLines.length,
+      total_billed_amt: totals.billed_amt,
+      total_allowed_amt: totals.allowed_amt,
+      total_provider_paid: totals.provider_paid,
+      total_patient_resp: totals.patient_resp,
+      total_amount: batchTotalAmount,
+      check_amount: batchTotalAmount,
+      auto_posted: 0,
+      needs_review: eobLines.length,
+      no_match: 0,
+      status: 'READY',
+    });
+    if (!eobBatch?.id) {
+      throw new BadGatewayException('Failed to create EOB batch.');
+    }
+
+    const createdLines = eobLines.length
+      ? await this.resourcesService.bulkCreate(
+          'EOBLine',
+          eobLines.map((line, index) => ({
+            ...line,
+            eob_id: eobId,
+            seq_no: index + 1,
+            payer_name: eobOutput.payer_name || '',
+            check_number: eobOutput.check_number || '',
+            check_date: eobOutput.check_date || '',
+            eob_batch_id: eobBatch.id,
+            source_file_uri: fileReference,
+            line_number: index + 1,
+            units: line.units || 1,
+            matched_claim_id: line.matched_claim_id || null,
+            match_score: line.match_score || 0,
+            status_bucket: line.status_bucket || 'NEEDS_REVIEW',
+          })),
+        )
+      : [];
+
+    return {
+      status: 'success',
+      eob_batch: eobBatch,
+      eob_lines: createdLines,
+      output,
+    };
   }
 
   async invokeLLM(payload: {
@@ -290,12 +631,228 @@ export class IntegrationsService {
   }
 
   private async extractTextFromFileReference(fileReference: string) {
+    if (fileReference.startsWith('s3://')) {
+      const meta = await this.filesService.getFileMetaFromReference(fileReference);
+      const fileName = meta.fileName.toLowerCase();
+      if (
+        meta.mimeType.startsWith('text/') ||
+        fileName.endsWith('.csv') ||
+        fileName.endsWith('.txt') ||
+        fileName.endsWith('.835')
+      ) {
+        return this.filesService.readTextFromReference(fileReference);
+      }
+
+      return this.extractTextWithTextract(fileReference);
+    }
+
     const meta = await this.filesService.getFileMetaFromReference(fileReference);
     if (!isPdfFile(meta.mimeType, meta.fileName)) {
       return this.filesService.readTextFromReference(fileReference);
     }
 
     return this.extractPdfTextWithMineru(fileReference, meta.fileName);
+  }
+
+  private async extractTextWithTextract(fileReference: string) {
+    const { bucket, key } = this.filesService.parseS3Reference(fileReference);
+    const startResult = await this.getTextractClient().send(
+      new StartDocumentAnalysisCommand({
+        DocumentLocation: {
+          S3Object: {
+            Bucket: bucket,
+            Name: key,
+          },
+        },
+        FeatureTypes: ['TABLES', 'FORMS', 'QUERIES'],
+        QueriesConfig: {
+          Queries: [
+            { Text: 'What is the check amount?', Alias: 'check amount', Pages: ['*'] },
+            { Text: 'What is the EFT amount?', Alias: 'eft amount', Pages: ['*'] },
+            { Text: 'What is the payment amount?', Alias: 'payment amount', Pages: ['*'] },
+            { Text: 'What is the total paid amount?', Alias: 'total paid amount', Pages: ['*'] },
+            { Text: 'What is the check number?', Alias: 'check number', Pages: ['*'] },
+            { Text: 'What is the EFT number?', Alias: 'eft number', Pages: ['*'] },
+            { Text: 'What is the payment date?', Alias: 'payment date', Pages: ['*'] },
+            { Text: 'What is the check date?', Alias: 'check date', Pages: ['*'] },
+            { Text: 'Who is the payer?', Alias: 'payer name', Pages: ['*'] },
+          ],
+        },
+      }),
+    );
+
+    if (!startResult.JobId) {
+      throw new BadGatewayException('Textract did not return a job id.');
+    }
+
+    return this.waitForTextractText(startResult.JobId);
+  }
+
+  private async waitForTextractText(jobId: string) {
+    const maxWaitSeconds = Number(
+      this.configService.get<string>('TEXTRACT_MAX_WAIT_SECONDS', '90'),
+    );
+    const startedAt = Date.now();
+    let nextToken: string | undefined;
+    const blocks: Block[] = [];
+
+    while (Date.now() - startedAt < maxWaitSeconds * 1000) {
+      const result = await this.getTextractClient().send(
+        new GetDocumentAnalysisCommand({
+          JobId: jobId,
+          NextToken: nextToken,
+        }),
+      );
+
+      if (result.JobStatus === 'FAILED') {
+        throw new BadGatewayException(
+          `Textract extraction failed: ${result.StatusMessage || 'unknown error'}`,
+        );
+      }
+
+      if (result.JobStatus === 'PARTIAL_SUCCESS') {
+        throw new BadGatewayException(
+          `Textract extraction partially failed: ${result.StatusMessage || 'partial success'}`,
+        );
+      }
+
+      if (result.JobStatus === 'SUCCEEDED') {
+        blocks.push(...(result.Blocks || []));
+        nextToken = result.NextToken;
+
+        if (!nextToken) {
+          return this.renderTextractBlocks(blocks);
+        }
+
+        continue;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+
+    throw new ServiceUnavailableException(
+      `Textract job ${jobId} is still processing. Increase TEXTRACT_MAX_WAIT_SECONDS or use a background job.`,
+    );
+  }
+
+  private renderTextractBlocks(blocks: Block[]) {
+    const renderedQueries = this.renderTextractQueries(blocks);
+    const renderedTables = this.renderTextractTables(blocks);
+    const lines = blocks
+      .filter((block) => block.BlockType === 'LINE' && block.Text)
+      .sort((left, right) => {
+        const leftPage = left.Page || 0;
+        const rightPage = right.Page || 0;
+        if (leftPage !== rightPage) {
+          return leftPage - rightPage;
+        }
+
+        const leftBox = left.Geometry?.BoundingBox;
+        const rightBox = right.Geometry?.BoundingBox;
+        const topDiff = (leftBox?.Top || 0) - (rightBox?.Top || 0);
+        if (Math.abs(topDiff) > 0.01) {
+          return topDiff;
+        }
+
+        return (leftBox?.Left || 0) - (rightBox?.Left || 0);
+      })
+      .map((block) => block.Text || '');
+
+    const renderedText = [renderedQueries, ...renderedTables, lines.join('\n')]
+      .filter((section) => section.trim())
+      .join('\n\n');
+
+    if (!renderedText.trim()) {
+      throw new BadGatewayException('Textract returned no readable text.');
+    }
+
+    return renderedText;
+  }
+
+  private renderTextractQueries(blocks: Block[]) {
+    const blocksById = new Map<string, Block>();
+    for (const block of blocks) {
+      if (block.Id) {
+        blocksById.set(block.Id, block);
+      }
+    }
+
+    return blocks
+      .filter((block) => block.BlockType === 'QUERY')
+      .map((queryBlock) => {
+        const answerIds =
+          queryBlock.Relationships?.filter((relationship) => relationship.Type === 'ANSWER')
+            .flatMap((relationship) => relationship.Ids || []) || [];
+        const answer = answerIds
+          .map((answerId) => blocksById.get(answerId))
+          .find((block) => block?.BlockType === 'QUERY_RESULT');
+        const label = queryBlock.Query?.Alias || queryBlock.Query?.Text || 'query';
+
+        return answer?.Text ? `${label}: ${answer.Text}` : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private renderTextractTables(blocks: Block[]) {
+    const blocksById = new Map<string, Block>();
+    for (const block of blocks) {
+      if (block.Id) {
+        blocksById.set(block.Id, block);
+      }
+    }
+
+    const textForBlock = (block: Block): string => {
+      if (block.Text) {
+        return block.Text;
+      }
+
+      const childIds =
+        block.Relationships?.filter((relationship) => relationship.Type === 'CHILD')
+          .flatMap((relationship) => relationship.Ids || []) || [];
+
+      return childIds
+        .map((childId) => blocksById.get(childId))
+        .filter((child): child is Block => child !== undefined)
+        .map((child) => textForBlock(child))
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+    };
+
+    return blocks
+      .filter((block) => block.BlockType === 'TABLE')
+      .map((tableBlock) => {
+        const cellIds =
+          tableBlock.Relationships?.filter((relationship) => relationship.Type === 'CHILD')
+            .flatMap((relationship) => relationship.Ids || []) || [];
+        const cells = cellIds
+          .map((cellId) => blocksById.get(cellId))
+          .filter((cell): cell is Block => cell?.BlockType === 'CELL');
+        const rows = new Map<number, Map<number, string>>();
+
+        for (const cell of cells) {
+          const rowIndex = cell.RowIndex || 1;
+          const columnIndex = cell.ColumnIndex || 1;
+          if (!rows.has(rowIndex)) {
+            rows.set(rowIndex, new Map());
+          }
+
+          rows.get(rowIndex)?.set(columnIndex, textForBlock(cell));
+        }
+
+        return [...rows.entries()]
+          .sort(([left], [right]) => left - right)
+          .map(([, columns]) =>
+            [...columns.entries()]
+              .sort(([left], [right]) => left - right)
+              .map(([, value]) => value)
+              .join('\t'),
+          )
+          .filter((row) => row.trim())
+          .join('\n');
+      })
+      .filter((table) => table.trim());
   }
 
   private async extractPdfTextWithMineru(fileReference: string, fileName: string) {
@@ -386,6 +943,7 @@ export class IntegrationsService {
         '- payer_name: payer/insurance name, not provider name unless payer is absent.',
         '- check_number: check, EFT, trace, payment, or remittance number. Use empty string if absent.',
         '- check_date: payment/check/remittance date in YYYY-MM-DD when possible.',
+        '- total_amount: the check/EFT/payment total amount for the whole remittance. Do not use billed, allowed, patient responsibility, or a single line amount for this field.',
         '',
         'Required EOB line rules:',
         '- Create one eob_lines item per service line/CPT/procedure row.',
@@ -463,7 +1021,22 @@ export class IntegrationsService {
   }) {
     const apiKey = this.configService.get<string>('OPENAI_API_KEY');
     if (!apiKey) {
-      return this.fallbackStructuredExtraction(responseJsonSchema, attachedFileTexts.join('\n\n'));
+      const fallbackResult = this.fallbackStructuredExtraction(
+        responseJsonSchema,
+        attachedFileTexts.join('\n\n'),
+      );
+      const fallbackEobResult = fallbackResult as { eob_lines?: unknown[] };
+      if (
+        getSchemaKind(responseJsonSchema) === 'eob' &&
+        Array.isArray(fallbackEobResult.eob_lines) &&
+        fallbackEobResult.eob_lines.length === 0
+      ) {
+        throw new ServiceUnavailableException(
+          'Textract extracted the document text, but the local EOB parser could not map this payer format into EOB lines. Add a payer-specific parser for this layout or upload a structured CSV/TXT/835 export.',
+        );
+      }
+
+      return fallbackResult;
     }
 
     const rawResponse = await this.callOpenAi({
@@ -604,6 +1177,11 @@ export class IntegrationsService {
       return mineruTableResult;
     }
 
+    const textractTableResult = this.extractTextractTableEobLines(text);
+    if (textractTableResult.eob_lines.length > 0) {
+      return textractTableResult;
+    }
+
     const rows = parseDelimitedText(text);
     if (rows.length < 2) {
       return {
@@ -653,13 +1231,106 @@ export class IntegrationsService {
       remark_code: row[remarkIndex] || '',
     }));
 
-    return {
-      payer_name: dataRows[0]?.[payerIndex] || '',
-      check_number: dataRows[0]?.[checkNumberIndex] || '',
-      check_date: normalizeDate(dataRows[0]?.[checkDateIndex]),
-      eob_lines: eobLines.filter(isUsefulEobLine),
-    };
-  }
+	    return {
+	      payer_name: dataRows[0]?.[payerIndex] || '',
+	      check_number: dataRows[0]?.[checkNumberIndex] || '',
+	      check_date: normalizeDate(dataRows[0]?.[checkDateIndex]),
+	      total_amount: extractCheckTotalAmount(text),
+	      eob_lines: eobLines.filter(isUsefulEobLine),
+	    };
+	  }
+
+  private extractTextractTableEobLines(text: string) {
+    const eobLines: Array<Record<string, unknown>> = [];
+
+    for (const section of splitTextTables(text)) {
+      const rows = parseDelimitedText(section);
+      if (rows.length < 2) {
+        continue;
+      }
+
+      const headerIndex = rows.findIndex((row) => getHeaderScore(row.map(normalizeHeaderCell)) >= 3);
+      if (headerIndex < 0) {
+        continue;
+      }
+
+      const headers = rows[headerIndex].map(normalizeHeaderCell);
+      const dataRows = rows.slice(headerIndex + 1);
+      let currentPatientName = '';
+
+      const patientIndex = getHeaderIndex(headers, ['patient name', 'member name', 'patient']);
+      const memberIndex = getHeaderIndex(headers, ['member', 'subscriber', 'member id']);
+      const dobIndex = getHeaderIndex(headers, ['dob', 'date of birth']);
+      const claimIndex = getHeaderIndex(headers, ['claim', 'icn', 'patient account', 'account', 'control']);
+      const dosIndex = getHeaderIndex(headers, ['dos', 'service date', 'from date', 'date of service']);
+      const cptIndex = getHeaderIndex(headers, ['cpt', 'procedure', 'proc', 'service code']);
+      const npiIndex = getHeaderIndex(headers, ['npi', 'rendering']);
+      const billedIndex = getHeaderIndex(headers, ['billed', 'charge', 'submitted']);
+      const allowedIndex = getHeaderIndex(headers, ['allowed', 'eligible', 'contracted']);
+      const paidIndex = getHeaderIndex(headers, ['provider paid', 'amount paid', 'net paid', 'paid', 'payment']);
+      const patientRespIndex = getHeaderIndex(headers, [
+        'patient resp',
+        'patient responsibility',
+        'pt resp',
+        'deduct',
+        'coins',
+        'copay',
+      ]);
+      const carcIndex = getHeaderIndex(headers, ['carc', 'reason code', 'adjustment code']);
+      const remarkIndex = getHeaderIndex(headers, ['remark', 'rarc']);
+
+      for (const row of dataRows) {
+        const rowText = row.join(' ').trim();
+        if (!rowText || rowLooksLikeSummary(rowText)) {
+          continue;
+        }
+
+        if (patientIndex >= 0 && row[patientIndex]) {
+          currentPatientName = row[patientIndex];
+        } else {
+          const patientLabelMatch = rowText.match(/patient(?: name)?[:\s]+([A-Z][A-Z ,.'-]{2,80})/i);
+          if (patientLabelMatch?.[1]) {
+            currentPatientName = patientLabelMatch[1].trim();
+          }
+        }
+
+        const rowNumbers = row.flatMap((cell) => numbersFromText(cell));
+        const amountNumbers = rowNumbers.filter((amount) => Math.abs(amount) > 0);
+        const fallbackPaid = amountNumbers.at(-1) || 0;
+        const fallbackAllowed = amountNumbers.length > 1 ? amountNumbers.at(-2) || 0 : 0;
+        const fallbackBilled = amountNumbers.length > 2 ? amountNumbers[0] || 0 : 0;
+
+        const line = {
+          patient_name: patientIndex >= 0 ? row[patientIndex] || currentPatientName : currentPatientName,
+          member_id: memberIndex >= 0 ? row[memberIndex] || '' : memberIdFromText(rowText),
+          dob: dobIndex >= 0 ? normalizeDate(row[dobIndex]) : '',
+          icn: claimIndex >= 0 ? row[claimIndex] || '' : '',
+          dos_from: dosIndex >= 0 ? normalizeDate(row[dosIndex]) : normalizeDate(firstDateFromText(rowText)),
+          dos_to: dosIndex >= 0 ? normalizeDate(row[dosIndex]) : normalizeDate(firstDateFromText(rowText)),
+          cpt: cptIndex >= 0 ? row[cptIndex] || '' : firstProcedureCodeFromText(rowText),
+          rendering_npi: npiIndex >= 0 ? row[npiIndex] || '' : firstMatch(rowText, /\bNPI[:\s]*(\d{10})\b/i),
+          billed_amt: billedIndex >= 0 ? toNumber(row[billedIndex]) : fallbackBilled,
+          allowed_amt: allowedIndex >= 0 ? toNumber(row[allowedIndex]) : fallbackAllowed,
+          provider_paid: paidIndex >= 0 ? toNumber(row[paidIndex]) : fallbackPaid,
+          patient_resp: patientRespIndex >= 0 ? toNumber(row[patientRespIndex]) : 0,
+          carc_code: carcIndex >= 0 ? row[carcIndex] || '' : '',
+          remark_code: remarkIndex >= 0 ? row[remarkIndex] || '' : '',
+        };
+
+        if (isUsefulEobLine(line)) {
+          eobLines.push(line);
+        }
+      }
+    }
+
+	    return {
+	      payer_name: this.inferPayerName(text),
+	      check_number: firstMatch(text, /(?:CHECK|EFT|TRACE|PAYMENT)[/#\s-]*(?:NUMBER|NO\.?)?[:\s]*([A-Z0-9-]+)/i),
+	      check_date: normalizeDate(firstMatch(text, /(?:CHECK|ISSUE|PAYMENT|REMITTANCE)\s*DATE[:\s]*([0-9/ -]{6,10})/i)),
+	      total_amount: extractCheckTotalAmount(text),
+	      eob_lines: eobLines,
+	    };
+	  }
 
   private extractMineruTableEobLines(text: string) {
     const blueShieldResult = this.extractBlueShieldEobLines(text);
@@ -667,13 +1338,14 @@ export class IntegrationsService {
       return blueShieldResult;
     }
 
-    return {
-      payer_name: this.inferPayerName(text),
-      check_number: firstMatch(text, /(?:CHECK|EFT|TRACE|PAYMENT)[/#\s-]*(?:NUMBER|NO\.?)[:\s]*([A-Z0-9-]+)/i),
-      check_date: normalizeDate(firstMatch(text, /(?:CHECK|ISSUE|PAYMENT|REMITTANCE)\s*DATE[:\s]*([0-9/ -]{6,10})/i)),
-      eob_lines: [],
-    };
-  }
+	    return {
+	      payer_name: this.inferPayerName(text),
+	      check_number: firstMatch(text, /(?:CHECK|EFT|TRACE|PAYMENT)[/#\s-]*(?:NUMBER|NO\.?)[:\s]*([A-Z0-9-]+)/i),
+	      check_date: normalizeDate(firstMatch(text, /(?:CHECK|ISSUE|PAYMENT|REMITTANCE)\s*DATE[:\s]*([0-9/ -]{6,10})/i)),
+	      total_amount: extractCheckTotalAmount(text),
+	      eob_lines: [],
+	    };
+	  }
 
   private inferPayerName(text: string) {
     const normalized = text.toLowerCase();
@@ -803,13 +1475,14 @@ export class IntegrationsService {
       }
     }
 
-    return {
-      payer_name: 'Blue Shield of California',
-      check_number: checkNumber || eobNumber,
-      check_date: issueDate,
-      eob_lines: eobLines,
-    };
-  }
+	    return {
+	      payer_name: 'Blue Shield of California',
+	      check_number: checkNumber || eobNumber,
+	      check_date: issueDate,
+	      total_amount: extractCheckTotalAmount(text),
+	      eob_lines: eobLines,
+	    };
+	  }
 
   private extractTransactions(text: string) {
     const rows = parseDelimitedText(text);

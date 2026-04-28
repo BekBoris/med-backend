@@ -56,6 +56,11 @@ export class FilesController {
 
   private async sendFile(reference: string, response: Response) {
     const meta = await this.filesService.getFileMetaFromReference(reference);
+    if (!meta.absolutePath) {
+      response.status(400).send('S3 files cannot be served through this endpoint.');
+      return;
+    }
+
     response.setHeader('Content-Type', meta.mimeType);
     response.setHeader('Content-Length', String(meta.size));
     response.setHeader('Content-Disposition', `inline; filename="${meta.fileName}"`);
