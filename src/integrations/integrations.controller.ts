@@ -85,4 +85,11 @@ export class IntegrationsController {
   ) {
     return this.integrationsService.invokeLLM(body);
   }
+
+  @Post('match-eob-lines-to-claims')
+  matchEobLinesToClaims(
+    @Body() body: { eob_lines?: Record<string, unknown>[]; claims?: Record<string, unknown>[] },
+  ) {
+    return this.integrationsService.matchEobLinesToClaims(body);
+  }
 }

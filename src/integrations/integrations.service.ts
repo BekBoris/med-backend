@@ -14,6 +14,7 @@ import {
   StartDocumentAnalysisCommand,
   TextractClient,
 } from '@aws-sdk/client-textract';
+import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
 import { ResourcesService } from '../resources/resources.service';
 
 type JsonSchema = Record<string, unknown>;
@@ -358,6 +359,7 @@ const extractCheckTotalAmount = (text: string) => {
 @Injectable()
 export class IntegrationsService {
   private textractClient?: TextractClient;
+  private bedrockClient?: BedrockRuntimeClient;
 
   constructor(
     private readonly filesService: FilesService,
@@ -373,6 +375,58 @@ export class IntegrationsService {
     }
 
     return this.textractClient;
+  }
+
+  private getBedrockClient() {
+    if (!this.bedrockClient) {
+      this.bedrockClient = new BedrockRuntimeClient({
+        region: this.configService.get<string>('AWS_REGION', 'us-west-1'),
+      });
+    }
+
+    return this.bedrockClient;
+  }
+
+  private async callBedrock({
+    prompt,
+    expectJson,
+  }: {
+    prompt: string;
+    expectJson: boolean;
+  }) {
+    const modelId = this.configService.get<string>(
+      'BEDROCK_MODEL_ID',
+      'us.anthropic.claude-sonnet-4-6',
+    );
+    const systemPrompt = expectJson
+      ? 'You extract structured data. Return JSON only. Do not wrap in markdown or code fences.'
+      : 'You are a concise medical billing assistant.';
+
+    const command = new InvokeModelCommand({
+      modelId,
+      contentType: 'application/json',
+      accept: 'application/json',
+      body: Buffer.from(
+        JSON.stringify({
+          anthropic_version: 'bedrock-2023-05-31',
+          max_tokens: 4096,
+          temperature: expectJson ? 0 : 0.2,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      ),
+    });
+
+    const response = await this.getBedrockClient().send(command);
+    const result = JSON.parse(Buffer.from(response.body).toString()) as {
+      content?: Array<{ text?: string }>;
+    };
+    const text = result.content?.[0]?.text ?? '';
+    if (!text) {
+      throw new BadGatewayException('Bedrock returned an empty response.');
+    }
+
+    return text;
   }
 
   async uploadFile(file: Express.Multer.File) {
@@ -999,12 +1053,7 @@ export class IntegrationsService {
     prompt: string;
     attachedFileTexts: string[];
   }) {
-    const apiKey = this.configService.get<string>('OPENAI_API_KEY');
-    if (!apiKey) {
-      return 'LLM provider is not configured. Set OPENAI_API_KEY in med-backend to enable AI responses.';
-    }
-
-    return this.callOpenAi({
+    return this.callBedrock({
       prompt: this.buildPrompt({ prompt, attachedFileTexts }),
       expectJson: false,
     });
@@ -1019,8 +1068,14 @@ export class IntegrationsService {
     responseJsonSchema: JsonSchema;
     attachedFileTexts: string[];
   }) {
-    const apiKey = this.configService.get<string>('OPENAI_API_KEY');
-    if (!apiKey) {
+    let rawResponse: string;
+    try {
+      rawResponse = await this.callBedrock({
+        prompt: this.buildPrompt({ prompt, attachedFileTexts, responseJsonSchema }),
+        expectJson: true,
+      });
+      return extractJsonObject(rawResponse);
+    } catch {
       const fallbackResult = this.fallbackStructuredExtraction(
         responseJsonSchema,
         attachedFileTexts.join('\n\n'),
@@ -1032,78 +1087,12 @@ export class IntegrationsService {
         fallbackEobResult.eob_lines.length === 0
       ) {
         throw new ServiceUnavailableException(
-          'Textract extracted the document text, but the local EOB parser could not map this payer format into EOB lines. Add a payer-specific parser for this layout or upload a structured CSV/TXT/835 export.',
+          'Bedrock could not extract EOB lines from this document. Upload a structured CSV/TXT/835 export, or check that the Claude 3.5 Sonnet model is enabled in your AWS Bedrock console.',
         );
       }
 
       return fallbackResult;
     }
-
-    const rawResponse = await this.callOpenAi({
-      prompt: this.buildPrompt({
-        prompt,
-        attachedFileTexts,
-        responseJsonSchema,
-      }),
-      expectJson: true,
-    });
-
-    return extractJsonObject(rawResponse);
-  }
-
-  private async callOpenAi({
-    prompt,
-    expectJson,
-  }: {
-    prompt: string;
-    expectJson: boolean;
-  }) {
-    const apiKey = this.configService.get<string>('OPENAI_API_KEY');
-    const model = this.configService.get<string>('OPENAI_MODEL', 'gpt-4o-mini');
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        temperature: expectJson ? 0 : 0.2,
-        response_format: expectJson ? { type: 'json_object' } : undefined,
-        messages: [
-          {
-            role: 'system',
-            content: expectJson
-              ? 'You extract structured data. Return JSON only and do not wrap it in markdown.'
-              : 'You are a concise medical billing assistant.',
-          },
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new BadGatewayException(`OpenAI request failed: ${errorBody}`);
-    }
-
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
-    };
-
-    const content = data.choices?.[0]?.message?.content;
-    if (typeof content === 'string') {
-      return content;
-    }
-
-    if (Array.isArray(content)) {
-      return content.map((item) => item.text || '').join('\n').trim();
-    }
-
-    throw new BadGatewayException('OpenAI returned an empty response.');
   }
 
   private fallbackStructuredExtraction(schema: JsonSchema, text: string) {
@@ -1525,6 +1514,82 @@ export class IntegrationsService {
       provider_name: dataRows[0]?.[providerIndex] || '',
       transactions,
       total_insurance_payment: transactions.reduce((sum, txn) => sum + Math.abs(txn.amount), 0),
+    };
+  }
+
+  async matchEobLinesToClaims(payload: {
+    eob_lines?: Record<string, unknown>[];
+    claims?: Record<string, unknown>[];
+  }) {
+    const eobLines = payload.eob_lines ?? [];
+    const allClaims = payload.claims ?? [];
+
+    // Pre-filter: for each EOB line find the top 15 candidate claims by basic heuristics
+    // so the Bedrock prompt stays within a manageable token count.
+    const candidateSets = eobLines.map((line) => {
+      const icn = String(line['icn'] ?? '').toLowerCase();
+      const lastName = String(line['patient_name'] ?? '').split(/[\s,]/)[0].toLowerCase();
+      const cpt = String(line['cpt'] ?? '');
+      const dosYear = String(line['dos_from'] ?? '').slice(0, 4);
+
+      const scored = allClaims.map((claim) => {
+        let score = 0;
+        if (icn && String(claim['bill_number'] ?? '').toLowerCase() === icn) score += 3;
+        if (lastName && String(claim['patient_last'] ?? String(claim['patient_name'] ?? '')).toLowerCase().includes(lastName)) score += 2;
+        if (cpt && String(claim['cpt_codes'] ?? '').includes(cpt)) score += 1;
+        if (dosYear && String(claim['dos'] ?? String(claim['date_of_service'] ?? '')).startsWith(dosYear)) score += 1;
+        return { claim, score };
+      });
+
+      return scored
+        .filter((s) => s.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 15)
+        .map((s) => s.claim);
+    });
+
+    const prompt = `You are a medical billing claim-matching assistant.
+For each EOB line, select the best matching claim from its candidate_claims list.
+Use patient name, date of service (dos_from/dos_to), CPT code, rendering NPI, billed amount, and ICN/bill_number to determine the best match.
+
+Return a JSON object with this exact structure (no markdown, no code fences):
+{
+  "matches": [
+    {
+      "eob_line_index": <number>,
+      "matched_claim_id": <string or null>,
+      "match_score": <0.0-1.0>,
+      "match_reason": <brief string>,
+      "status_bucket": <"AUTO_POST"|"NEEDS_REVIEW"|"NO_MATCH">
+    }
+  ]
+}
+
+Scoring rules:
+- match_score >= 0.90 → status_bucket "AUTO_POST"
+- match_score 0.70 to 0.89 → status_bucket "NEEDS_REVIEW"
+- match_score < 0.70 or no reasonable match → status_bucket "NO_MATCH", matched_claim_id null
+
+EOB Lines and Candidates:
+${JSON.stringify(
+  eobLines.map((line, i) => ({
+    eob_line_index: i,
+    eob_line: line,
+    candidate_claims: candidateSets[i],
+  })),
+  null,
+  2,
+)}`;
+
+    const raw = await this.callBedrock({ prompt, expectJson: true });
+    return extractJsonObject(raw) as {
+      matches: Array<{
+        eob_line_index: number;
+        matched_claim_id: string | null;
+        match_score: number;
+        match_reason: string;
+        status_bucket: string;
+      }>;
     };
   }
 }
